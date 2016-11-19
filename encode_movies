@@ -1,0 +1,437 @@
+#!/usr/bin/perl -w
+
+# Unbuffer STDOUT
+$| = 1;
+
+# Libraries
+use File::Copy qw(move);
+use File::Basename;
+use File::Spec;
+use File::Find;
+use File::Path qw(make_path);
+
+# Universal Def
+$program_name = basename($0);
+$config_dir = "/etc/${program_name}";
+$config_file_full = "${config_dir}/${program_name}.conf";
+$temp_dir = "/tmp/$program_name";
+$ffmpeg = "/root/bin/ffmpeg -hide_banner";
+$ffprobe = "/root/bin/ffprobe -hide_banner";
+$ccextractor = "/root/bin/ccextractor -quiet -out=srt -in=ts";
+$comchap = "/root/bin/comchap";
+
+# Video Settings
+$video_scale = "-vf scale=1280:-1";
+$video_options_x264 = "-c:v libx264 -crf 23 -preset:v veryfast -profile:v main -level 4.0 $video_scale";
+#$video_options_x265 = "-c:v libx265 -x265-params crf=23 -preset:v veryfast $video_scale";
+$video_options = $video_options_x264;  # Use h.264 for the time being.
+$audio_options = "-ac 2 -c:a libfdk_aac -vbr 3";
+
+# Plex Settings
+$ENV{'LD_LIBRARY_PATH'} = '/usr/lib/plexmediaserver';
+$ENV{'PLEX_MEDIA_SERVER_APPLICATION_SUPPORT_DIR'} = '/var/lib/plexmediaserver/Library/Application Support';
+@plex_libraries = (4,5,6,8);  # From Plex Media Scanner --list (the libraries I want to scan)
+$plex_scanner = "/usr/lib/plexmediaserver/Plex Media Scanner";
+
+# Usage
+$usage = " $0 [-h] [-verbose] -i <directory> [-d <duplicate_dir>] [-r <recycle_dir>] [-lock]
+";
+
+# Options Handling
+use Getopt::Long;
+$Getopt::Long::ignorecase = 1;
+$Getopt::Long::autoabbrev = 1; 
+&GetOptions(
+            "i=s"       => \$dir,
+            "r=s"       => \$recycle_dir,
+            "d=s"       => \$duplicate_dir,
+            "install"   => \$install,
+            "uninstall" => \$uninstall,
+            "verbose"   => \$verbose,
+            "lock"      => \$lock,
+            "h|help"    => \$help
+            );
+
+if ($help or $help) { print $usage; exit 0; }
+
+
+if ($install) 
+{
+    $config_text = 
+"-i \"/media/movies/Movies/Unwatched\"
+-r \"/media/movies/Movies/.recycle\"
+-d \"/media/movies/Movies/Unwatched/Shared\" \"/media/movies/Movies/Unwatched/Reed\" \"/media/movies/Movies/Unwatched/Heather\"
+";
+
+    # Create config file
+    mkdir $config_dir;
+    open(FILE, ">$config_file_full") or die "-F- Unable to open $config_file_full\n";
+    print FILE $config_text;
+    close FILE;
+
+    exit;
+}
+
+if ($uninstall) 
+{
+    # Remove the config file
+    unlink $config_file_full;
+    rmdir $config_dir;
+
+    exit;
+}
+
+# Read conf if all the directories don't have values.
+($dir_conf, $recycle_dir_conf, $duplicate_dir_conf) = &read_conf unless ($dir and $recycle_dir);
+
+# Assign if there was no value provided at the prompt.
+$dir ||= $dir_conf;
+$recycle_dir ||= $recycle_dir_conf;
+$duplicate_dir ||= $duplicate_dir_conf;
+
+# Check all the directories.
+die "-F- Input/Recycle Directories are all required\n" unless ($dir and $recycle_dir);
+print "-I- Using:\n\tInput Dir: $dir\n\tRecycle Dir: $recycle_dir\n" if ($verbose);
+
+die "-F- Input/Recycle Directories must be unique\n" if ($dir eq $recycle_dir);
+die "-F- Input/Recycle/Duplicate Directories must be absolute paths\n"
+    unless (File::Spec->file_name_is_absolute( $dir ) and
+            File::Spec->file_name_is_absolute( $recycle_dir ));
+die "-F- Input directory $dir isn't a directory\n" unless (-d $dir);
+die "-F- Recycle directory $recycle_dir isn't a directory\n" unless (-d $recycle_dir);
+
+my @duplicate_dir;
+if ($duplicate_dir) 
+{
+    if ($duplicate_dir =~ /^\"([^\"]+)\"\s+\"([^\"]+)\"\s+\"([^\"]+)\"$/) 
+    {
+        print "-I- Duplicate Directory:\n\t$1\n\t\t=> $2\n\t\t=> $3\n" if ($verbose);
+        @duplicate_dir = ($1, $2, $3);
+
+        die "-F- Duplicate source directory $1 isn't a directory\n" unless (-d $1);
+        die "-F- Duplicate to_dir1 directory $2 isn't a directory\n" unless (-d $2);
+        die "-F- Duplicate to_dir2 directory $3 isn't a directory\n" unless (-d $3);
+
+        die "-F- Duplicate directories must be absolute paths\n"
+            unless (File::Spec->file_name_is_absolute( $1 ) and
+                    File::Spec->file_name_is_absolute( $2 ) and
+                    File::Spec->file_name_is_absolute( $3 ));
+    }
+    else 
+    {
+        die "-F- Malformed Duplicate directory.  It should be formatted: -d \"source\" \"to_dir1\" \"to_dir2\"\n";
+    }
+}
+
+# Don't start more than one copy of this script.
+$lockfile = "/var/lock/${program_name}.lock";
+if (-e $lockfile and not $lock) 
+{
+    # Allow to run quiet unless there is an error or verbose.
+    print "-F- $program_name is already running\n" if ($verbose);
+    exit;
+}
+
+# Fix Plex permissions
+system("chown -R root:users $dir");
+system("chmod -R 775 $dir");
+system("chmod -R g+s $dir");
+
+# touch lockfile
+system("touch $lockfile");
+
+%input_files = ();
+find(\&process_match, $dir);
+sub process_match 
+{
+    # Definitions:
+    #
+    # $full_file = /bla/bla/file.ext
+    # $basename_ext = file.ext
+    # $basename = file
+    # $ext = ext
+    
+    my $basename_ext = $_;
+    my $basename;
+    my $ext;
+    
+    if (($basename, $ext) = $basename_ext =~ /^(.*)\.(ts)$/) 
+    {
+        my $full_file = $File::Find::name;
+
+        print "-I- Found .ts (encoding): $basename ($ext)\n\tFull: \'$full_file\'\n" if ($verbose);
+
+        $input_files{$basename} = $full_file;
+    }
+    elsif (($basename, $ext) = $basename_ext =~ /^(.*)\.(mp4)$/) 
+    {
+        my $full_file = $File::Find::name;
+
+        print "-I- Found .mp4 (existing): $basename ($ext)\n\tFull: \'$full_file\'\n" if ($verbose);
+
+        $output_files{$basename} = $full_file;
+    }
+}
+
+foreach $input_base (sort keys %input_files) 
+{
+    # There exists the same name in the output directory.
+    if (exists $output_files{$input_base}) 
+    {
+        print "-I- Found matching file \'$input_files{$input_base}\' => \'$output_files{$input_base}\'\n" if ($verbose);
+        if (&compare_duration($input_files{$input_base}, $output_files{$input_base}) > 0.5)
+        {
+            # File has not been properly encoded
+            # Delete the file in the output directory and encode again.
+            print "-I- Output file $input_base length doesn't match input file.  Removing output directory file.\n" if ($verbose);
+            unlink $output_files{$input_base};
+
+            # Encode file.
+            &encode($input_base);
+        }
+        else 
+        {
+            print "-I- Output file $input_base length matches input file, not encoding.\n" if ($verbose);
+
+            # Move the input file to the recycle folder
+            &recycle($input_base);
+
+            # Go to the next file.
+            next;
+        }
+    }
+    else 
+    {
+        # Encode file.
+        &encode($input_base);
+    }
+
+    # Check the lengths
+    my $duration_delta = &compare_duration($input_files{$input_base}, $output_files{$input_base});
+    &mydie("-F- Encoded file $input_base is a different length than the original by ${duration_delta}s\n")
+        if ($duration_delta > 0.5);
+
+    # Change the date with touch
+    system("touch -r \"$input_files{$input_base}\" \"$output_files{$input_base}\"");
+
+    # Move the input file to the recycle folder
+    &recycle($input_base);
+}
+
+if ($duplicate_dir) 
+{
+    # Duplicate shared movies to specified directories
+    find(\&process_duplicate, $duplicate_dir[0]);
+    
+    # Reflesh Plex
+    &refresh_plex;
+}
+
+# remove lockfile
+unlink $lockfile;
+if (-d $temp_dir) 
+{
+    unlink "$temp_dir/*";
+    rmdir $temp_dir;
+}
+
+
+##########
+## Subs ##
+##########
+
+sub compare_duration 
+{
+    my $file1 = shift @_;
+    my $file2 = shift @_;
+
+    my $delta = abs(&get_duration($file1) - &get_duration($file2));
+
+    return $delta;
+}
+
+sub get_duration 
+{
+    my $file = shift @_;
+    
+    chomp (my $line = `$ffprobe \"$file\" 2>&1 | fgrep Duration`);
+    my ($duration_raw) = $line =~ /Duration:\s+([0-9\.\:]+),/;
+    &mydie("-F- Unable to find the duration of $file\n") unless ($duration_raw);
+    
+    
+    # Example: 00:00:14.57
+    my ($hrs, $min, $sec, $msec) = $duration_raw =~ /(\d{2}):(\d{2}):(\d{2})\.(\d{2})/;
+    my $duration = 3600 * $hrs + 60 * $min + $sec + 0.01 *$msec;
+    
+    print "-I- Duration: ${duration}s ($file)\n" if ($verbose);
+    return $duration;
+}
+
+sub encode 
+{
+    my $input_base = shift @_;
+    my $input_file_full = $input_files{$input_base};
+
+    my $output_file_full = $input_file_full;
+    $output_file_full =~ s/ts$/mp4/;
+    my $temp_file_full = "$temp_dir/${input_base}.mp4";
+
+    my $output_srt_full = $input_file_full;
+    $output_srt_full =~ s/ts$/eng.srt/;
+    my $temp_srt_full = "$temp_dir/${input_base}.eng.srt";
+
+    mkdir $temp_dir unless (-d $temp_dir);
+
+    #####################
+    print "-I- Extracting subtitles: \'$input_file_full\'\n" if ($verbose);
+    my $start_time = time();
+    my $system_result = system("nice -19 $ccextractor \"$input_file_full\" -o \"$temp_srt_full\"");
+    my $total_time = time() - $start_time;
+    print "-I- Extraction Took ${total_time}s.\n" if ($verbose);
+    &mydie("-F- Subtitle extract failed: \'$input_base\'\n") unless (-e $temp_srt_full and not $system_result);
+    
+    print "-I- Encoding: \'$input_file_full\' => \'$output_file_full\'\n" if ($verbose);
+    $start_time = time();
+    $system_result = system("nice -19 $ffmpeg -i \"$input_file_full\" $video_options $audio_options \"$temp_file_full\" >/dev/null 2>&1");
+    $total_time = time() - $start_time;
+    print "-I- Encode Took ${total_time}s.\n" if ($verbose);
+    &mydie("-F- Encode failed: \'$input_base\'\n") unless (-e $temp_file_full and not $system_result);
+
+    print "-I- Marking Commercials with comchap: '$temp_file_full\'\n" if ($verbose);
+    $start_time = time();
+    $system_result = system("nice -19 $comchap \"$temp_file_full\"");
+    $total_time = time() - $start_time;
+    print "-I- Marking Commercials Took ${total_time}s.\n" if ($verbose);
+    &mydie("-F- Marking failed: \'$temp_file_full\'\n") unless (-e $temp_file_full and not $system_result);
+    #####################
+    
+    
+    move $temp_file_full,$output_file_full;
+    move $temp_srt_full,$output_srt_full;
+    chmod 0664,$output_file_full;
+    chmod 0664,$output_srt_full;
+    
+    $output_files{$input_base} = $output_file_full;
+}
+
+sub recycle 
+{
+    my $base = shift @_;
+    my $basename_ext = basename($input_files{$base});
+    
+    move $input_files{$input_base},"$recycle_dir/$basename_ext";
+}
+
+sub mydie 
+{
+    # remove lockfile
+    unlink $lockfile;
+
+    if (-d $temp_dir) 
+    {
+        unlink "$temp_dir/*";
+        rmdir $temp_dir;
+    }
+    
+    my $message = shift @_;
+    die $message;
+}
+
+sub read_conf {
+    #
+    # Load the conf file
+    #
+    my ($dir, $recycle, $duplicate);
+    
+    open(FILE, "<$config_file_full") or die "-F- Unable to open config file $config_file_full\n";
+    while (my $line = <FILE>)
+    {
+        next if ($line =~ /^\#/);
+        
+        if ($line =~ /^\s*-([ir])\s+\"?(\S+.*\S+)\"?\s*$/) {
+            $dir = $2 if ($1 eq "i");
+            $recycle = $2 if ($1 eq "r");
+        }
+        elsif ($line =~ /^\s*-([d])\s+(\S+.*\S+)\s*$/) {
+            $duplicate = $2 if ($1 eq "d");
+        }
+    }
+    close FILE;
+
+    return ($dir, $recycle, $duplicate);
+}
+
+sub refresh_plex 
+{
+    foreach $library (@plex_libraries) 
+    {
+        my $plex_scanner_cmd = "\"$plex_scanner\" --scan --section $library";
+        
+        if ($verbose) 
+        {
+            print "-I- $plex_scanner_cmd\n";
+            system($plex_scanner_cmd);            
+        }
+        else 
+        {
+            system("$plex_scanner_cmd >/dev/null 2>&1");
+        }
+
+    }
+}
+
+sub process_duplicate 
+{
+    my $file_name = $_;
+    
+    if ($file_name =~ /^(.*)\.(mp4|srt|mkv)$/) 
+    {
+        my $full_file = $File::Find::name;
+        my $full_dir = $File::Find::dir;
+        
+        print "-I- Found .mp4|.srt (duplicaton): \'$file_name\'\n\tFull: \'$full_file\'\n\tDirectory: \'$full_dir\'\n" if ($verbose);
+        
+        # Create subdirectories (if needed)
+        my $create_dir = $full_dir;
+        $create_dir =~ s/^$duplicate_dir[0]//;
+        
+        my $to_dir1 = $duplicate_dir[1];
+        my $to_dir2 = $duplicate_dir[2];
+        if ($create_dir) 
+        {
+            $to_dir1 .= $create_dir;
+            $to_dir2 .= $create_dir;
+            
+            foreach $to_dir ($to_dir1, $to_dir2) 
+            {
+                unless (-d $to_dir) 
+                {
+                    print "-I- Creating directory: \'$to_dir\'\n" if ($verbose);
+                    &mydie("-F- Cannot create directory: \'$to_dir\'\n")
+                        unless make_path($to_dir);
+                    
+                    chmod 0775, $to_dir;
+                }
+            }
+        }
+        
+        # Hard Link the files
+        my $to_file_full1 = $to_dir1 . "/" . $file_name;
+        my $to_file_full2 = $to_dir2 . "/" . $file_name;
+        
+        unless (-e $to_file_full1 or -e $to_file_full2) 
+        {
+            print "-I- Linking: \'$full_file\'\n\t=> \'$to_file_full1\'\n\t=> \'$to_file_full2\'\n" if ($verbose);
+            
+            link $full_file, $to_file_full1;
+            link $full_file, $to_file_full2;
+            
+            chmod 0775,$to_file_full1;
+            chmod 0775,$to_file_full2;
+        }
+        
+        # Remove the original
+        print "-I- Unlink (original): \'$full_file\'\n" if ($verbose);
+        unlink $full_file;
+    }
+}
