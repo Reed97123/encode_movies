@@ -17,12 +17,13 @@ $config_file_full = "${config_dir}/${program_name}.conf";
 $temp_dir = "/tmp/$program_name";
 $ffmpeg = "/root/bin/ffmpeg -hide_banner";
 $ffprobe = "/root/bin/ffprobe -hide_banner";
-$ccextractor = "/root/bin/ccextractor -quiet -out=srt -in=ts";
+$ccextractor = "/root/bin/ccextractor -out=srt -in=ts";
 $comchap = "/root/bin/comchap";
 
 # Video Settings
 $video_scale = "-vf scale=1280:-1";
-$video_options_x264 = "-c:v libx264 -crf 23 -preset:v veryfast -profile:v main -level 4.0 $video_scale";
+$video_preset = "veryfast";
+$video_options_x264 = "-c:v libx264 -crf 23 -preset:v $video_preset -profile:v main -level 4.0 $video_scale";
 #$video_options_x265 = "-c:v libx265 -x265-params crf=23 -preset:v veryfast $video_scale";
 $video_options = $video_options_x264;  # Use h.264 for the time being.
 $audio_options = "-ac 2 -c:a libfdk_aac -vbr 3";
@@ -48,12 +49,30 @@ $Getopt::Long::autoabbrev = 1;
             "install"   => \$install,
             "uninstall" => \$uninstall,
             "verbose"   => \$verbose,
+            "test"      => \$test,
             "lock"      => \$lock,
             "h|help"    => \$help
             );
 
 if ($help or $help) { print $usage; exit 0; }
 
+if ($test) 
+{
+    $video_preset = "ultrafast";
+    $verbose = 1;
+    $lock = 1;
+}
+
+if ($verbose) 
+{
+    $cmd_post = "";
+    $comchap .= " --verbose";
+}
+else 
+{
+    $cmd_post = ">/dev/null 2>&1";
+    $ccextractor .= " -quiet";
+}
 
 if ($install) 
 {
@@ -292,7 +311,7 @@ sub encode
     
     print "-I- Encoding: \'$input_file_full\' => \'$output_file_full\'\n" if ($verbose);
     $start_time = time();
-    $system_result = system("nice -19 $ffmpeg -i \"$input_file_full\" $video_options $audio_options \"$temp_file_full\" >/dev/null 2>&1");
+    $system_result = system("nice -19 $ffmpeg -i \"$input_file_full\" $video_options $audio_options \"$temp_file_full\" $cmd_post");
     $total_time = time() - $start_time;
     print "-I- Encode Took ${total_time}s.\n" if ($verbose);
     &mydie("-F- Encode failed: \'$input_base\'\n") unless (-e $temp_file_full and not $system_result);
@@ -367,16 +386,8 @@ sub refresh_plex
     {
         my $plex_scanner_cmd = "\"$plex_scanner\" --scan --section $library";
         
-        if ($verbose) 
-        {
-            print "-I- $plex_scanner_cmd\n";
-            system($plex_scanner_cmd);            
-        }
-        else 
-        {
-            system("$plex_scanner_cmd >/dev/null 2>&1");
-        }
-
+        print "-I- $plex_scanner_cmd\n" if ($verbose);
+        system("$plex_scanner_cmd $cmd_post");
     }
 }
 
@@ -428,10 +439,17 @@ sub process_duplicate
             
             chmod 0775,$to_file_full1;
             chmod 0775,$to_file_full2;
+
+            if (-e $to_file_full1 and -e $to_file_full2) 
+            {
+                # Remove the original
+                print "-I- Unlink (original): \'$full_file\'\n" if ($verbose);
+                unlink $full_file;
+            }
+            else 
+            {
+                &mydie("-F- Unsuccessful creation of new hard links to files: $to_file_full1 and $to_file_full2\n");
+            }
         }
-        
-        # Remove the original
-        print "-I- Unlink (original): \'$full_file\'\n" if ($verbose);
-        unlink $full_file;
     }
 }
